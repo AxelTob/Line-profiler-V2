@@ -1,12 +1,9 @@
-#!/usr/bin/env python
-
 import functools
 import inspect
 import linecache
 import os
 import sys
-
-from line_profiler import LineProfiler as CLineProfiler
+from line_profiler import LineProfiler
 
 
 def is_coroutine(f):
@@ -21,12 +18,8 @@ def is_classmethod(f):
     return isinstance(f, classmethod)
 
 
-class LineProfiler(CLineProfiler):
-    """A profiler that records the execution times of individual lines."""
-
+class MyLineProfiler(LineProfiler):
     def __call__(self, func):
-        """Decorate a function to start the profiler on function entry and stop
-        it on function exit."""
         self.add_function(func)
         if is_classmethod(func):
             wrapper = self.wrap_classmethod(func)
@@ -39,182 +32,104 @@ class LineProfiler(CLineProfiler):
         return wrapper
 
     def wrap_classmethod(self, func):
-        """Wrap a classmethod to profile it."""
         @functools.wraps(func)
         def wrapper(*args, **kwds):
-            self.enable_by_count()
-            try:
+            with self:
                 result = func.__func__(func.__class__, *args, **kwds)
-            finally:
-                self.disable_by_count()
             return result
         return wrapper
 
     def wrap_coroutine(self, func):
-        """Wrap a Python 3.5+ coroutine to profile it."""
         @functools.wraps(func)
         async def wrapper(*args, **kwds):
-            self.enable_by_count()
-            try:
+            with self:
                 result = await func(*args, **kwds)
-            finally:
-                self.disable_by_count()
             return result
         return wrapper
 
     def wrap_generator(self, func):
-        """Wrap a generator to profile it."""
         @functools.wraps(func)
         def wrapper(*args, **kwds):
             g = func(*args, **kwds)
-            # The first iterate will not be a .send()
-            self.enable_by_count()
-            try:
+            with self:
                 item = next(g)
-            except StopIteration:
-                return
-            finally:
-                self.disable_by_count()
             input_ = (yield item)
-            # But any following one might be.
             while True:
-                self.enable_by_count()
-                try:
+                with self:
                     item = g.send(input_)
-                except StopIteration:
-                    return
-                finally:
-                    self.disable_by_count()
                 input_ = (yield item)
         return wrapper
 
     def wrap_function(self, func):
-        """Wrap a function to profile it."""
         @functools.wraps(func)
         def wrapper(*args, **kwds):
-            self.enable_by_count()
-            try:
+            with self:
                 result = func(*args, **kwds)
-            finally:
-                self.disable_by_count()
             return result
         return wrapper
 
     def print_stats(self, stream=None, output_unit=None, stripzeros=False):
-        """Show the gathered statistics."""
-        lstats = self.get_stats()
-        show_text(lstats.timings, lstats.unit, output_unit=output_unit,
+        stats = self.get_stats()
+        show_text(stats.timings, stats.unit, output_unit=output_unit,
                   stream=stream, stripzeros=stripzeros)
 
-    def run(self, cmd):
-        """Profile a single executable statement in the main namespace."""
-        import __main__
-        main_dict = __main__.__dict__
-        return self.runctx(cmd, main_dict, main_dict)
-
-    def runctx(self, cmd, globals, locals):
-        """Profile a single executable statement in the given namespaces."""
-        self.enable_by_count()
-        try:
-            exec(cmd, globals, locals)
-        finally:
-            self.disable_by_count()
-        return self
-
-    def runcall(self, func, *args, **kw):
-        """ Profile a single function call.
-        """
-        self.enable_by_count()
-        try:
-            return func(*args, **kw)
-        finally:
-            self.disable_by_count()
-
     def add_module(self, mod):
-        """ Add all the functions in a module and its classes.
-        """
-        from inspect import isclass, isfunction
-
         nfuncsadded = 0
         for item in mod.__dict__.values():
-            if isclass(item):
+            if inspect.isclass(item):
                 for k, v in item.__dict__.items():
-                    if isfunction(v):
+                    if inspect.isfunction(v):
                         self.add_function(v)
                         nfuncsadded += 1
-            elif isfunction(item):
+            elif inspect.isfunction(item):
                 self.add_function(item)
                 nfuncsadded += 1
-
         return nfuncsadded
 
+    def show_func(filename, start_lineno, func_name, timings, unit,
+                  output_unit=None, stream=None, stripzeros=False):
+        if not stream:
+            stream = sys.stdout
+        if not os.path.exists(filename):
+            stream.write(f"Could not find file {filename}\n")
+            return
+        total_time = sum(time for _, _, time in timings)
+        if stripzeros and total_time == 0:
+            return
+        if not output_unit:
+            output_unit = unit
 
-def show_func(filename, start_lineno, func_name, timings, unit,
-              output_unit=None, stream=None, stripzeros=False):
-    """ Show results for a single function.
-    """
-    if stream is None:
-        stream = sys.stdout
+        scalar = unit / output_unit
+        stream.write(
+            f"Total time in {func_name}: {total_time * scalar:6.3f} s\n")
+        stream.write(f"File: {filename}\n")
+        stream.write(f"Function: {func_name} at line {start_lineno}\n")
 
-    template = '%6s %9s %12s %8s %8s  %-s'
-    d = {}
-    total_time = 0.0
-    linenos = []
-    for lineno, nhits, time in timings:
-        total_time += time
-        linenos.append(lineno)
-
-    if stripzeros and total_time == 0:
-        return
-
-    if output_unit is None:
-        output_unit = unit
-    scalar = unit / output_unit
-
-    stream.write('Total time: %g s\n' % (total_time * unit))
-    if os.path.exists(filename):
-        stream.write(f'File: {filename}\n')
-        stream.write(f'Function: {func_name} at line {start_lineno}\n')
-        # Clear the cache to ensure that we get up-to-date results.
         linecache.clearcache()
         all_lines = linecache.getlines(filename)
         sublines = inspect.getblock(all_lines[start_lineno - 1:])
-    else:
-        stream.write('\n')
-        stream.write(f'Could not find file {filename}\n')
-        stream.write(
-            'Are you sure you are running this program from the same directory\n')
-        stream.write('that you ran the profiler from?\n')
-        stream.write("Continuing without the function's contents.\n")
-        # Fake empty lines so we can see the timings, if not the code.
-        nlines = 1 if not linenos else max(
-            linenos) - min(min(linenos), start_lineno) + 1
-        sublines = [''] * nlines
-    for lineno, nhits, time in timings:
-        if total_time == 0:  # Happens rarely on empty function
-            percent = ''
-        else:
-            percent = '%5.1f' % (100 * time / total_time)
-        d[lineno] = (nhits,
-                     '%5.1f' % (time * scalar),
-                     '%5.1f' % (float(time) * scalar / nhits),
-                     percent)
-    linenos = range(start_lineno, start_lineno + len(sublines))
-    empty = ('', '', '', '')
-    header = template % ('Line #', 'Hits', 'Time', 'Per Hit', '% Time',
-                         'Line Contents')
-    stream.write('\n')
-    stream.write(header)
-    stream.write('\n')
-    stream.write('=' * len(header))
-    stream.write('\n')
-    for lineno, line in zip(linenos, sublines):
-        nhits, time, per_hit, percent = d.get(lineno, empty)
-        txt = template % (lineno, nhits, time, per_hit, percent,
-                          line.rstrip('\n').rstrip('\r'))
-        stream.write(txt)
-        stream.write('\n')
-    stream.write('\n')
+
+        d = {}
+        for lineno, nhits, time in timings:
+            percent = '' if sum(
+                time for _, _, time in timings) == 0 else f'{100 * time / sum(time for _, _, time in timings): 5.1f}'
+            d[lineno] = (nhits,
+                         f"{time * scalar:5.1f}",
+                         f"{float(time) * scalar / nhits:5.1f}",
+                         percent)
+
+        header = f"{'Line #':6} {'Hits':9} {'Time':12} {'Per Hit':8} {'% Time':8}  {'Line Contents':-s}"
+        stream.write("\n" + header + "\n")
+        stream.write("=" * len(header) + "\n")
+
+        empty = ("", "", "", "")
+        linenos = range(start_lineno, start_lineno + len(sublines))
+        for lineno, line in zip(linenos, sublines):
+            nhits, time, per_hit, percent = d.get(lineno, empty)
+            txt = f"{lineno:6} {nhits:9} {time:12} {per_hit:8} {percent:8} {line.rstrip():-s}"
+            stream.write(txt + "\n")
+
+        stream.write("\n")
 
 
 def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False):
@@ -238,18 +153,35 @@ def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False):
 profile = LineProfiler()
 
 
-@profile
+def call_a():
+    import time
+    users = [{"user": {i}} for i in range(1000)]
+    time.sleep(0.1)
+    for _ in range(1000):
+        pass
+    return 1
+
+
+def call_b():
+    users = [{"user": {i}} for i in range(1000)]
+    return users
+
+
+@ profile
 def testfunc():
     """ A function to test the profiler.
     """
     n = 10
     for i in range(n):
         print(i)
+        call_a()
+
+    call_b()
 
 
 def main():
     testfunc()
-    profile.print_stats()
+    profile.print_stats(output_unit=1e-3)
 
 
 if __name__ == '__main__':
